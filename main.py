@@ -21,34 +21,39 @@ logging.basicConfig(
 )
 
 
-def allowed_by_keywords(item_name: str) -> bool:
+def allowed_by_keywords(listing) -> bool:
+    if listing.value_source == "confirmed":
+        return True
+
     keywords = [k.strip().lower() for k in settings.require_keywords.split(",") if k.strip()]
     if not keywords:
         return True
-    name = item_name.lower()
+    name = listing.item_name.lower()
     return any(k in name for k in keywords)
 
 
 def compute_confidence_score(opp) -> int:
     score = 0
     name = opp.listing.item_name.lower()
+    roi_percent = opp.roi_percent if opp.roi_percent is not None else -999
+    profit = opp.profit if opp.profit is not None else -999
 
-    if opp.roi_percent >= 80:
+    if roi_percent >= 80:
         score += 35
-    elif opp.roi_percent >= 40:
+    elif roi_percent >= 40:
         score += 25
-    elif opp.roi_percent >= 20:
+    elif roi_percent >= 20:
         score += 15
-    elif opp.roi_percent >= 5:
+    elif roi_percent >= 5:
         score += 8
 
-    if opp.profit >= 0.10:
+    if profit >= 0.10:
         score += 25
-    elif opp.profit >= 0.05:
+    elif profit >= 0.05:
         score += 18
-    elif opp.profit >= 0.02:
+    elif profit >= 0.02:
         score += 12
-    elif opp.profit >= 0.01:
+    elif profit >= 0.01:
         score += 6
 
     if opp.listing.buy_price <= 0.05:
@@ -65,12 +70,37 @@ def compute_confidence_score(opp) -> int:
     if "autographed" in name:
         score -= 8
 
+    priced_gems = [g for g in opp.listing.gems if g.market_price > 0]
+    unpriced_gems = [g for g in opp.listing.gems if g.market_price <= 0]
+
     if opp.gems_total > 0:
         score += 10
+    if len(priced_gems) >= 2:
+        score += 6
+    if any(g.name.lower().startswith(("ethereal gem", "prismatic gem", "kinetic gem")) for g in priced_gems):
+        score += 8
     if opp.listing.value_source == "confirmed":
         score += 35
+    if unpriced_gems:
+        score -= min(len(unpriced_gems) * 8, 24)
+    if opp.price_status == "unknown_price":
+        score -= 15
+    if opp.listing.value_source != "confirmed":
+        score -= 12
 
     return max(0, min(score, 100))
+
+
+def format_money(value: float | None) -> str:
+    return "unknown" if value is None else f"${value:.2f}"
+
+
+def format_roi(value: float | None) -> str:
+    return "unknown" if value is None else f"{value:.1f}%"
+
+
+def format_number(value: float | None, digits: int) -> str:
+    return "" if value is None else f"{value:.{digits}f}"
 
 
 def format_alert(opp, score: int) -> str:
@@ -94,10 +124,11 @@ def format_alert(opp, score: int) -> str:
         f"🎯 {opp.listing.item_name}\n"
         f"Status: {source_label}\n"
         f"Confidence: {score}/100\n"
-        f"Чистая прибыль: ${opp.profit:.2f} ({opp.roi_percent:.1f}%)\n\n"
+        f"Чистая прибыль: {format_money(opp.profit)} ({format_roi(opp.roi_percent)})\n\n"
         f"Цена лота: ${opp.listing.buy_price:.2f}\n"
         f"Сумма гемов (оценка): ${opp.gems_total:.2f}\n"
-        f"Ожидаемая выручка (нетто): ${opp.expected_sell_net:.2f}\n\n"
+        f"Ожидаемая выручка (нетто): ${opp.expected_sell_net:.2f}\n"
+        f"Price status: {opp.price_status} {opp.unknown_price_reason}\n\n"
         f"Гемы:\n{gems_lines}\n\n"
         f"{warning_text}\n"
         f"Market listing:\n{opp.listing.market_url}\n\n"
@@ -132,10 +163,57 @@ def append_signal_csv(opp, score: int):
                 f"{opp.listing.buy_price:.4f}",
                 f"{opp.gems_total:.4f}",
                 f"{opp.expected_sell_net:.4f}",
-                f"{opp.profit:.4f}",
-                f"{opp.roi_percent:.2f}",
+                format_number(opp.profit, 4),
+                format_number(opp.roi_percent, 2),
                 score,
                 opp.listing.value_source,
+                opp.listing.market_url,
+                opp.listing.search_url,
+            ]
+        )
+
+
+def append_unknown_candidate_csv(opp, score: int, reason: str):
+    file_exists = os.path.exists(settings.unknown_csv_file)
+    with open(settings.unknown_csv_file, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(
+                [
+                    "timestamp_utc",
+                    "reason",
+                    "item_name",
+                    "buy_price",
+                    "detected_gems",
+                    "gem_prices",
+                    "total_extractable_value",
+                    "expected_sell_net",
+                    "profit",
+                    "roi_percent",
+                    "confidence_score",
+                    "value_source",
+                    "price_status",
+                    "unknown_price_reason",
+                    "market_url",
+                    "search_url",
+                ]
+            )
+        writer.writerow(
+            [
+                datetime.now(timezone.utc).isoformat(),
+                reason,
+                opp.listing.item_name,
+                format_number(opp.listing.buy_price, 4),
+                "; ".join(g.name for g in opp.listing.gems),
+                "; ".join(f"{g.name}={format_number(g.market_price, 4)}:{g.source}" for g in opp.listing.gems),
+                format_number(opp.gems_total, 4),
+                format_number(opp.expected_sell_net, 4),
+                format_number(opp.profit, 4),
+                format_number(opp.roi_percent, 2),
+                score,
+                opp.listing.value_source,
+                opp.price_status,
+                opp.unknown_price_reason,
                 opp.listing.market_url,
                 opp.listing.search_url,
             ]
@@ -167,6 +245,50 @@ def inc_hourly_limit():
     alerts_sent_this_hour += 1
 
 
+def format_gems_for_log(listing) -> str:
+    if not listing.gems:
+        return "none"
+    return "; ".join(
+        f"{gem.name}=${gem.market_price:.4f}/{gem.source}" for gem in listing.gems
+    )
+
+
+def has_priced_gem(listing) -> bool:
+    return any(gem.market_price > 0 for gem in listing.gems)
+
+
+def log_decision(reason: str, listing, opp=None, score: int | None = None, extra: str = ""):
+    if not settings.debug_skip_details and not reason.startswith("ALERT"):
+        return
+
+    parts = [
+        f"[{reason}] {listing.item_name}",
+        f"source={listing.value_source}",
+        f"buy=${listing.buy_price:.4f}",
+        f"gems=[{format_gems_for_log(listing)}]",
+        f"detection_reason={listing.detection_reason}",
+    ]
+    if opp is not None:
+        parts.extend(
+            [
+                f"gems_total=${opp.gems_total:.4f}",
+                f"expected_net=${opp.expected_sell_net:.4f}",
+                f"profit={format_money(opp.profit)}",
+                f"roi={format_roi(opp.roi_percent)}",
+                f"price_status={opp.price_status}",
+                f"unknown_price_reason={opp.unknown_price_reason}",
+            ]
+        )
+    if score is not None:
+        parts.append(f"confidence={score}")
+    if extra:
+        parts.append(extra)
+
+    msg = " ".join(parts)
+    print(msg)
+    logging.info(msg)
+
+
 async def run_once(notifier: TelegramNotifier, storage: AlertStorage):
     listings = await fetch_listings(settings.scan_mode, settings.max_listings_per_run)
 
@@ -177,12 +299,20 @@ async def run_once(notifier: TelegramNotifier, storage: AlertStorage):
         return
 
     for listing in listings:
-        if listing.buy_price < settings.min_buy_price_usd or listing.buy_price > settings.max_buy_price_usd:
-            print(f"[SKIP] {listing.item_name} price=${listing.buy_price:.2f} out_of_range")
+        if listing.buy_price <= 0:
+            log_decision("UNKNOWN", listing, extra="reason=item_price_unknown")
             continue
 
-        if not allowed_by_keywords(listing.item_name):
-            print(f"[SKIP] {listing.item_name} keyword_filter")
+        if listing.buy_price < settings.min_buy_price_usd:
+            log_decision(
+                "SKIP",
+                listing,
+                extra=f"reason=item_price_out_of_range side=below_min min=${settings.min_buy_price_usd:.4f}",
+            )
+            continue
+
+        if not allowed_by_keywords(listing):
+            log_decision("SKIP", listing, extra="reason=keyword_filter")
             continue
 
         opp = calc_opportunity(
@@ -192,21 +322,72 @@ async def run_once(notifier: TelegramNotifier, storage: AlertStorage):
             base_item_resale=0.00,
         )
 
-        if opp.profit < settings.min_profit_usd or opp.roi_percent < settings.min_roi_percent:
-            print(f"[SKIP] {listing.item_name} profit=${opp.profit:.2f} roi={opp.roi_percent:.1f}%")
+        score = compute_confidence_score(opp)
+        log_decision("EVAL", listing, opp=opp, score=score, extra="stage=profitability_check")
+
+        if not listing.gems:
+            log_decision("SKIP", listing, opp=opp, score=score, extra="reason=no_gem_detected")
             continue
 
-        score = compute_confidence_score(opp)
+        if opp.price_status == "unknown_price":
+            if score >= settings.unknown_min_confidence_score:
+                append_unknown_candidate_csv(opp, score, opp.unknown_price_reason or "gem_price_unknown")
+            log_decision(
+                "UNKNOWN",
+                listing,
+                opp=opp,
+                score=score,
+                extra=f"reason={opp.unknown_price_reason or 'gem_price_unknown'}",
+            )
+            continue
+
+        if listing.buy_price > settings.max_buy_price_usd and (opp.profit is None or opp.profit < settings.min_profit_usd):
+            log_decision(
+                "SKIP",
+                listing,
+                opp=opp,
+                score=score,
+                extra=f"reason=item_price_out_of_range side=above_max max=${settings.max_buy_price_usd:.4f} not_profitable=true",
+            )
+            continue
+
+        if opp.profit is None or opp.profit < settings.min_profit_usd:
+            log_decision(
+                "SKIP",
+                listing,
+                opp=opp,
+                score=score,
+                extra=f"reason=negative_profit min_profit=${settings.min_profit_usd:.4f}",
+            )
+            continue
+
+        if opp.roi_percent is None or opp.roi_percent < settings.min_roi_percent:
+            log_decision(
+                "SKIP",
+                listing,
+                opp=opp,
+                score=score,
+                extra=f"reason=roi_below_min min_roi={settings.min_roi_percent:.1f}%",
+            )
+            continue
+
         if score < settings.min_confidence_score:
-            print(f"[SKIP] {listing.item_name} score={score}<{settings.min_confidence_score}")
+            log_decision(
+                "SKIP",
+                listing,
+                opp=opp,
+                score=score,
+                extra=f"reason=low_confidence min_confidence={settings.min_confidence_score}",
+            )
             continue
 
         if not await can_alert(storage, listing.listing_id, settings.alert_cooldown_sec):
-            print(f"[COOLDOWN] {listing.item_name}")
+            log_decision("COOLDOWN", listing, opp=opp, score=score, extra="reason=alert_cooldown")
             continue
 
         if not check_hourly_limit():
             print("[RATE_LIMIT] max alerts/hour reached")
+            logging.info("[RATE_LIMIT] max alerts/hour reached")
             break
 
         sent = await notifier.send(format_alert(opp, score))
@@ -214,11 +395,9 @@ async def run_once(notifier: TelegramNotifier, storage: AlertStorage):
             await mark_alerted(storage, listing.listing_id)
             inc_hourly_limit()
             append_signal_csv(opp, score)
-            msg = f"[ALERT] {listing.item_name} profit=${opp.profit:.2f} score={score}"
-            print(msg)
-            logging.info(msg)
+            log_decision("ALERT", listing, opp=opp, score=score)
         else:
-            print(f"[WARN] failed send: {listing.item_name}")
+            log_decision("WARN", listing, opp=opp, score=score, extra="reason=telegram_send_failed")
 
 
 async def main():
