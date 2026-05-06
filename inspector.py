@@ -63,6 +63,14 @@ SOCKET_GEM_PATTERNS = (
         re.compile(rf"\bInscribed(?:\s+Gem)?\s*{GEM_VALUE_SEPARATOR}\s*([^\n\r<]+)", re.IGNORECASE),
         "Inscribed Gem",
     ),
+    (
+        re.compile(rf"\bAscendant(?:\s+Gem)?\s*{GEM_VALUE_SEPARATOR}\s*([^\n\r<]+)", re.IGNORECASE),
+        "Ascendant Gem",
+    ),
+    (
+        re.compile(r"\bFoulfell\s+Shard\b", re.IGNORECASE),
+        "Foulfell Shard",
+    ),
 )
 TAG_RE = re.compile(r"<[^>]+>")
 GEM_PRICE_CACHE: dict[str, float] = {}
@@ -115,10 +123,13 @@ def extract_gem_market_names_from_text(text: str) -> list[str]:
 
     for pattern, template in SOCKET_GEM_PATTERNS:
         for match in pattern.finditer(clean_text):
-            gem_name = clean_gem_name(match.group(1))
-            if not gem_name:
-                continue
-            market_name = template.format(name=gem_name) if "{name}" in template else template
+            if "{name}" in template:
+                gem_name = clean_gem_name(match.group(1))
+                if not gem_name:
+                    continue
+                market_name = template.format(name=gem_name)
+            else:
+                market_name = template
             if market_name not in found:
                 found.append(market_name)
 
@@ -299,9 +310,16 @@ async def price_confirmed_gems(
         price = await fetch_priceoverview(session, market_name)
         if price <= 0:
             if include_unpriced:
-                gems.append(Gem(name=market_name, market_price=0.0, source="confirmed_unpriced"))
+                gems.append(
+                    Gem(
+                        name=market_name,
+                        market_price=0.0,
+                        source="confirmed_unpriced",
+                        price_status="unknown_price",
+                    )
+                )
             continue
-        gems.append(Gem(name=market_name, market_price=price, source="confirmed"))
+        gems.append(Gem(name=market_name, market_price=price, source="confirmed", price_status="priced"))
     return gems
 
 
@@ -382,6 +400,8 @@ async def build_confirmed_listing_from_asset(
         market_url=build_market_url(market_hash_name),
         search_url=build_search_url(market_hash_name),
         value_source="confirmed",
+        item_price_status="priced" if buy_price > 0 else "unknown_price",
+        detection_reason="confirmed_socket_description",
     )
 
 

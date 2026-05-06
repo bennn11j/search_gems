@@ -29,6 +29,8 @@ STANDALONE_GEM_PREFIXES = (
     "prismatic gem",
     "genuine gem",
     "strange gem",
+    "ascendant gem",
+    "foulfell shard",
 )
 STANDALONE_GEM_MARKERS = (
     " gem -",
@@ -169,7 +171,7 @@ async def fetch_listings_mock(limit: int = 20) -> list[Listing]:
 
     out: list[Listing] = []
     for r in raw:
-        gems = [Gem(name=n, market_price=p) for n, p in r["gems"]]
+        gems = [Gem(name=n, market_price=p, source="mock") for n, p in r["gems"]]
         market_hash_name = r["market_hash_name"]
         out.append(
             Listing(
@@ -181,6 +183,8 @@ async def fetch_listings_mock(limit: int = 20) -> list[Listing]:
                 market_url=build_market_url(market_hash_name),
                 search_url=build_search_url(market_hash_name),
                 value_source="estimated",
+                item_price_status="priced",
+                detection_reason="mock_fixture",
             )
         )
     return out
@@ -192,11 +196,37 @@ def estimate_gems_by_keywords(name: str) -> list[Gem]:
     if settings.exclude_standalone_gems and is_standalone_gem_item(lowered_name):
         return []
 
+    estimates = (
+        ("inscribed", "Estimated Inscribed Socket Value", 0.03),
+        ("autographed", "Estimated Autographed Socket Value", 0.02),
+        ("kinetic", "Estimated Kinetic Socket Value", 0.08),
+        ("ethereal", "Estimated Ethereal Socket Value", 0.10),
+        ("prismatic", "Estimated Prismatic Socket Value", 0.10),
+        ("ascendant", "Estimated Ascendant Socket Value", 0.05),
+        ("foulfell", "Estimated Foulfell Socket Value", 0.05),
+    )
+
     gems = []
-    if "inscribed" in lowered_name:
-        gems.append(Gem(name="Estimated Inscribed Socket Value", market_price=0.03))
-    if "autographed" in lowered_name:
-        gems.append(Gem(name="Estimated Autographed Socket Value", market_price=0.02))
+    for marker, gem_name, fallback_price in estimates:
+        if marker in lowered_name:
+            gems.append(
+                Gem(
+                    name=gem_name,
+                    market_price=fallback_price,
+                    source="estimated_keyword",
+                    price_status="estimated",
+                )
+            )
+
+    if "socket" in lowered_name and not gems:
+        gems.append(
+            Gem(
+                name="Unknown Socket Property",
+                market_price=0.0,
+                source="estimated_unpriced",
+                price_status="unknown_price",
+            )
+        )
 
     return gems
 
@@ -267,6 +297,7 @@ async def fetch_listings_real(limit: int = 20) -> list[Listing]:
         "estimated_candidates": 0,
         "filtered_candidates": 0,
         "inspect_failures": 0,
+        "duplicate_listing": 0,
     }
 
     async with aiohttp.ClientSession(
@@ -304,6 +335,13 @@ async def fetch_listings_real(limit: int = 20) -> list[Listing]:
                     listing_id = f"search::{market_hash_name}"
 
                     if listing_id in seen:
+                        stats.setdefault("duplicate_listing", 0)
+                        stats["duplicate_listing"] += 1
+                        if settings.debug_skip_details:
+                            log_scanner_event(
+                                logging.INFO,
+                                f"[SKIP] {name} reason=duplicate_listing listing_id={listing_id}",
+                            )
                         continue
                     seen.add(listing_id)
 
@@ -393,6 +431,8 @@ async def fetch_listings_real(limit: int = 20) -> list[Listing]:
                             market_url=build_market_url(market_hash_name),
                             search_url=build_search_url(market_hash_name),
                             value_source="estimated",
+                            item_price_status="priced" if price > 0 else "unknown_price",
+                            detection_reason="keyword_estimate",
                         )
                     )
 
@@ -406,6 +446,7 @@ async def fetch_listings_real(limit: int = 20) -> list[Listing]:
             f"search_results={stats['search_results']}, "
             f"skipped_standalone={stats['skipped_standalone']}, "
             f"filtered_candidates={stats['filtered_candidates']}, "
+            f"duplicate_listing={stats['duplicate_listing']}, "
             f"candidate_market_items={stats['candidate_market_items']}, "
             f"search_asset_confirmed={stats['search_asset_confirmed']}, "
             f"inspected_market_items={stats['inspected_market_items']}, "
