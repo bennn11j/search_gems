@@ -61,7 +61,7 @@ SOCKET_GEM_PATTERNS = (
     ),
     (
         re.compile(rf"\bInscribed(?:\s+Gem)?\s*{GEM_VALUE_SEPARATOR}\s*([^\n\r<]+)", re.IGNORECASE),
-        "Inscribed Gem - {name}",
+        "Inscribed Gem",
     ),
 )
 TAG_RE = re.compile(r"<[^>]+>")
@@ -118,7 +118,7 @@ def extract_gem_market_names_from_text(text: str) -> list[str]:
             gem_name = clean_gem_name(match.group(1))
             if not gem_name:
                 continue
-            market_name = template.format(name=gem_name)
+            market_name = template.format(name=gem_name) if "{name}" in template else template
             if market_name not in found:
                 found.append(market_name)
 
@@ -272,9 +272,20 @@ async def fetch_priceoverview(session: aiohttp.ClientSession, market_hash_name: 
             await asyncio.sleep(0.5 * (attempt + 1))
 
     price = 0.0
-    if data.get("success") and isinstance(data.get("lowest_price"), str):
-        price = parse_price_to_usd(data["lowest_price"])
+    if data.get("success"):
+        if isinstance(data.get("lowest_price"), str):
+            price = parse_price_to_usd(data["lowest_price"])
+        elif isinstance(data.get("median_price"), str):
+            price = parse_price_to_usd(data["median_price"])
     GEM_PRICE_CACHE[market_hash_name] = price
+    if settings.debug_skip_details:
+        logging.info(
+            "[PRICE] gem=%s lowest=%s median=%s used=$%.4f",
+            market_hash_name,
+            data.get("lowest_price"),
+            data.get("median_price"),
+            price,
+        )
     return price
 
 

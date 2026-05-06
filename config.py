@@ -65,6 +65,12 @@ class Settings(BaseModel):
     }
 
     min_confidence_score: int = int(os.getenv("MIN_CONFIDENCE_SCORE", "55"))
+    debug_skip_details: bool = os.getenv("DEBUG_SKIP_DETAILS", "true").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     max_inspect_failures_per_run: int = int(os.getenv("MAX_INSPECT_FAILURES_PER_RUN", "8"))
     steam_request_retries: int = int(os.getenv("STEAM_REQUEST_RETRIES", "2"))
     csv_file: str = os.getenv("CSV_FILE", "signals.csv")

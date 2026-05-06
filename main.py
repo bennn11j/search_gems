@@ -181,6 +181,47 @@ def inc_hourly_limit():
     alerts_sent_this_hour += 1
 
 
+def format_gems_for_log(listing) -> str:
+    if not listing.gems:
+        return "none"
+    return "; ".join(
+        f"{gem.name}=${gem.market_price:.4f}/{gem.source}" for gem in listing.gems
+    )
+
+
+def has_priced_gem(listing) -> bool:
+    return any(gem.market_price > 0 for gem in listing.gems)
+
+
+def log_decision(reason: str, listing, opp=None, score: int | None = None, extra: str = ""):
+    if not settings.debug_skip_details and not reason.startswith("ALERT"):
+        return
+
+    parts = [
+        f"[{reason}] {listing.item_name}",
+        f"source={listing.value_source}",
+        f"buy=${listing.buy_price:.4f}",
+        f"gems=[{format_gems_for_log(listing)}]",
+    ]
+    if opp is not None:
+        parts.extend(
+            [
+                f"gems_total=${opp.gems_total:.4f}",
+                f"expected_net=${opp.expected_sell_net:.4f}",
+                f"profit=${opp.profit:.4f}",
+                f"roi={opp.roi_percent:.1f}%",
+            ]
+        )
+    if score is not None:
+        parts.append(f"confidence={score}")
+    if extra:
+        parts.append(extra)
+
+    msg = " ".join(parts)
+    print(msg)
+    logging.info(msg)
+
+
 async def run_once(notifier: TelegramNotifier, storage: AlertStorage):
     listings = await fetch_listings(settings.scan_mode, settings.max_listings_per_run)
 
@@ -191,12 +232,28 @@ async def run_once(notifier: TelegramNotifier, storage: AlertStorage):
         return
 
     for listing in listings:
-        if listing.buy_price < settings.min_buy_price_usd or listing.buy_price > settings.max_buy_price_usd:
-            print(f"[SKIP] {listing.item_name} price=${listing.buy_price:.2f} out_of_range")
+        if listing.buy_price <= 0:
+            log_decision("SKIP", listing, extra="reason=missing_buy_price")
+            continue
+
+        if listing.buy_price < settings.min_buy_price_usd:
+            log_decision(
+                "SKIP",
+                listing,
+                extra=f"reason=below_min_price min=${settings.min_buy_price_usd:.4f}",
+            )
             continue
 
         if not allowed_by_keywords(listing):
-            print(f"[SKIP] {listing.item_name} keyword_filter")
+            log_decision("SKIP", listing, extra="reason=keyword_filter")
+            continue
+
+        if listing.value_source == "confirmed" and not has_priced_gem(listing):
+            log_decision(
+                "SKIP",
+                listing,
+                extra="reason=confirmed_gems_unpriced priceoverview_missing=true",
+            )
             continue
 
         opp = calc_opportunity(
@@ -206,21 +263,56 @@ async def run_once(notifier: TelegramNotifier, storage: AlertStorage):
             base_item_resale=0.00,
         )
 
-        if opp.profit < settings.min_profit_usd or opp.roi_percent < settings.min_roi_percent:
-            print(f"[SKIP] {listing.item_name} profit=${opp.profit:.2f} roi={opp.roi_percent:.1f}%")
+        score = compute_confidence_score(opp)
+        log_decision("EVAL", listing, opp=opp, score=score, extra="stage=profitability_check")
+
+        if listing.buy_price > settings.max_buy_price_usd and opp.profit < settings.min_profit_usd:
+            log_decision(
+                "SKIP",
+                listing,
+                opp=opp,
+                score=score,
+                extra=f"reason=above_max_price max=${settings.max_buy_price_usd:.4f} not_profitable=true",
+            )
             continue
 
-        score = compute_confidence_score(opp)
+        if opp.profit < settings.min_profit_usd:
+            log_decision(
+                "SKIP",
+                listing,
+                opp=opp,
+                score=score,
+                extra=f"reason=profit_below_min min_profit=${settings.min_profit_usd:.4f}",
+            )
+            continue
+
+        if opp.roi_percent < settings.min_roi_percent:
+            log_decision(
+                "SKIP",
+                listing,
+                opp=opp,
+                score=score,
+                extra=f"reason=roi_below_min min_roi={settings.min_roi_percent:.1f}%",
+            )
+            continue
+
         if score < settings.min_confidence_score:
-            print(f"[SKIP] {listing.item_name} score={score}<{settings.min_confidence_score}")
+            log_decision(
+                "SKIP",
+                listing,
+                opp=opp,
+                score=score,
+                extra=f"reason=confidence_below_min min_confidence={settings.min_confidence_score}",
+            )
             continue
 
         if not await can_alert(storage, listing.listing_id, settings.alert_cooldown_sec):
-            print(f"[COOLDOWN] {listing.item_name}")
+            log_decision("COOLDOWN", listing, opp=opp, score=score, extra="reason=alert_cooldown")
             continue
 
         if not check_hourly_limit():
             print("[RATE_LIMIT] max alerts/hour reached")
+            logging.info("[RATE_LIMIT] max alerts/hour reached")
             break
 
         sent = await notifier.send(format_alert(opp, score))
@@ -228,11 +320,9 @@ async def run_once(notifier: TelegramNotifier, storage: AlertStorage):
             await mark_alerted(storage, listing.listing_id)
             inc_hourly_limit()
             append_signal_csv(opp, score)
-            msg = f"[ALERT] {listing.item_name} profit=${opp.profit:.2f} score={score}"
-            print(msg)
-            logging.info(msg)
+            log_decision("ALERT", listing, opp=opp, score=score)
         else:
-            print(f"[WARN] failed send: {listing.item_name}")
+            log_decision("WARN", listing, opp=opp, score=score, extra="reason=telegram_send_failed")
 
 
 async def main():
