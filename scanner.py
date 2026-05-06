@@ -1,3 +1,6 @@
+import asyncio
+import logging
+
 import aiohttp
 from urllib.parse import quote
 
@@ -33,6 +36,15 @@ STANDALONE_GEM_MARKERS = (
     " autograph:",
     " sticker",
 )
+
+
+def parse_csv_setting(raw_value: str) -> tuple[str, ...]:
+    return tuple(value.strip().lower() for value in raw_value.split(",") if value.strip())
+
+
+def log_scanner_event(level: int, message: str):
+    print(message)
+    logging.log(level, message)
 
 
 def parse_price_to_usd(price_text: str) -> float:
@@ -81,11 +93,22 @@ def is_standalone_gem_item(name: str) -> bool:
     return any(marker in lowered_name for marker in STANDALONE_GEM_MARKERS)
 
 
-def is_socket_candidate(name: str) -> bool:
+def is_socket_candidate(name: str, broad_discovery: bool = False) -> bool:
     lowered_name = name.lower()
     if settings.exclude_standalone_gems and is_standalone_gem_item(lowered_name):
         return False
-    return any(keyword in lowered_name for keyword in ("inscribed", "autographed"))
+
+    excluded_keywords = parse_csv_setting(settings.exclude_item_keywords)
+    if any(keyword in lowered_name for keyword in excluded_keywords):
+        return False
+
+    if broad_discovery:
+        return True
+
+    candidate_keywords = parse_csv_setting(settings.candidate_keywords)
+    if not candidate_keywords:
+        return True
+    return any(keyword in lowered_name for keyword in candidate_keywords)
 
 
 async def fetch_market_search_page(
@@ -106,11 +129,24 @@ async def fetch_market_search_page(
         f"&norender=1"
         f"&currency={CURRENCY_USD}"
     )
-    async with session.get(url, timeout=20) as resp:
-        if resp.status != 200:
-            txt = await resp.text()
-            raise RuntimeError(f"Steam search error {resp.status}: {txt[:150]}")
-        return await resp.json()
+    retries = max(settings.steam_request_retries, 0)
+    for attempt in range(retries + 1):
+        try:
+            async with session.get(url, timeout=20) as resp:
+                if resp.status != 200:
+                    txt = await resp.text()
+                    raise RuntimeError(f"Steam search error {resp.status}: {txt[:150]}")
+                return await resp.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as exc:
+            if attempt >= retries:
+                raise
+            await asyncio.sleep(0.5 * (attempt + 1))
+            log_scanner_event(
+                logging.WARNING,
+                f"[WARN] retry Steam search query={query or '<empty>'} "
+                f"start={start} attempt={attempt + 2}/{retries + 1}: {exc}",
+            )
+    return {}
 
 
 async def fetch_listings_mock(limit: int = 20) -> list[Listing]:
@@ -229,6 +265,8 @@ async def fetch_listings_real(limit: int = 20) -> list[Listing]:
         "inspected_market_items": 0,
         "confirmed_listings": 0,
         "estimated_candidates": 0,
+        "filtered_candidates": 0,
+        "inspect_failures": 0,
     }
 
     async with aiohttp.ClientSession(
@@ -247,7 +285,7 @@ async def fetch_listings_real(limit: int = 20) -> list[Listing]:
                     )
                 except Exception as e:
                     display_query = query or "<empty>"
-                    print(f"[WARN] query '{display_query}' failed: {e}")
+                    log_scanner_event(logging.WARNING, f"[WARN] query '{display_query}' failed: {e}")
                     continue
 
                 results = data.get("results", [])
@@ -273,8 +311,12 @@ async def fetch_listings_real(limit: int = 20) -> list[Listing]:
                         stats["skipped_standalone"] += 1
                         continue
 
-                    if not settings.confirm_socket_gems and not is_socket_candidate(name):
+                    broad_discovery = settings.confirm_socket_gems and not query and not search_descriptions
+                    if not is_socket_candidate(name, broad_discovery=broad_discovery):
+                        stats.setdefault("filtered_candidates", 0)
+                        stats["filtered_candidates"] += 1
                         continue
+
                     stats["candidate_market_items"] += 1
 
                     price = extract_price(result)
@@ -305,14 +347,25 @@ async def fetch_listings_real(limit: int = 20) -> list[Listing]:
                                 max_listings=settings.listing_sample_count,
                             )
                         except Exception as e:
-                            print(f"[WARN] inspect '{market_hash_name}' failed: {e}")
+                            stats["inspect_failures"] += 1
+                            log_scanner_event(
+                                logging.WARNING,
+                                f"[WARN] inspect '{market_hash_name}' failed: {e}",
+                            )
+                            if stats["inspect_failures"] >= settings.max_inspect_failures_per_run:
+                                log_scanner_event(
+                                    logging.WARNING,
+                                    "[WARN] too many listing-render failures; stopping current scan early",
+                                )
+                                return out
                             confirmed_listings = []
 
                         if settings.inspect_debug:
-                            print(
+                            log_scanner_event(
+                                logging.DEBUG,
                                 "[DEBUG] inspect "
                                 f"market_hash_name='{market_hash_name}' "
-                                f"confirmed_listings={len(confirmed_listings)}"
+                                f"confirmed_listings={len(confirmed_listings)}",
                             )
 
                         if not confirmed_listings and len(unconfirmed_market_hash_names) < 10:
@@ -347,15 +400,18 @@ async def fetch_listings_real(limit: int = 20) -> list[Listing]:
                         return out
 
     if not out:
-        print(
+        log_scanner_event(
+            logging.INFO,
             "[INFO] scanner stats: "
             f"search_results={stats['search_results']}, "
             f"skipped_standalone={stats['skipped_standalone']}, "
+            f"filtered_candidates={stats['filtered_candidates']}, "
             f"candidate_market_items={stats['candidate_market_items']}, "
             f"search_asset_confirmed={stats['search_asset_confirmed']}, "
             f"inspected_market_items={stats['inspected_market_items']}, "
+            f"inspect_failures={stats['inspect_failures']}, "
             f"confirmed_listings={stats['confirmed_listings']}, "
-            f"estimated_candidates={stats['estimated_candidates']}"
+            f"estimated_candidates={stats['estimated_candidates']}",
         )
         if settings.inspect_debug and unconfirmed_market_hash_names:
             async with aiohttp.ClientSession(
@@ -370,7 +426,7 @@ async def fetch_listings_real(limit: int = 20) -> list[Listing]:
                         )
                         summary_lines = summarize_listing_render(render_data)
                     except Exception as e:
-                        print(f"[WARN] debug render sample failed for '{market_hash_name}': {e}")
+                        log_scanner_event(logging.WARNING, f"[WARN] debug render sample failed for '{market_hash_name}': {e}")
                         continue
 
                     if summary_lines == ["listing_count=0"] and market_hash_name != unconfirmed_market_hash_names[-1]:

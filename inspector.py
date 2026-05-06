@@ -1,10 +1,13 @@
+import asyncio
 import html
+import logging
 import re
 from typing import Any
 from urllib.parse import quote
 
 import aiohttp
 
+from app.config import settings
 from app.models import Gem, Listing
 
 APP_ID = 570
@@ -56,9 +59,17 @@ SOCKET_GEM_PATTERNS = (
         ),
         "Autograph Rune - {name}",
     ),
+    (
+        re.compile(rf"\bInscribed(?:\s+Gem)?\s*{GEM_VALUE_SEPARATOR}\s*([^\n\r<]+)", re.IGNORECASE),
+        "Inscribed Gem - {name}",
+    ),
 )
 TAG_RE = re.compile(r"<[^>]+>")
 GEM_PRICE_CACHE: dict[str, float] = {}
+GEM_NAME_STOP_RE = re.compile(
+    r"(?:socket|gem type|quality|hero|used by|wearable| |\$|marketable|tradable)",
+    re.IGNORECASE,
+)
 
 
 def strip_html(value: str) -> str:
@@ -69,8 +80,14 @@ def strip_html(value: str) -> str:
 def clean_gem_name(raw_name: str) -> str:
     cleaned = strip_html(raw_name)
     cleaned = re.split(r"(?:\s{2,}|\n|\r|<|>|\||•)", cleaned, maxsplit=1)[0]
+    cleaned = GEM_NAME_STOP_RE.split(cleaned, maxsplit=1)[0]
     cleaned = re.sub(r"\s+", " ", cleaned)
-    return cleaned.strip(" .:-—–\t")
+    cleaned = cleaned.strip(" .:-—–\t")
+    if not cleaned or len(cleaned) > 80:
+        return ""
+    if cleaned.lower() in {"empty", "none", "socket", "gem"}:
+        return ""
+    return cleaned
 
 
 def iter_description_values(descriptions) -> list[str]:
@@ -205,11 +222,26 @@ async def fetch_listing_render(
         f"https://steamcommunity.com/market/listings/{APP_ID}/{quote(market_hash_name, safe='')}/render/"
         f"?query=&start=0&count={count}&currency={CURRENCY_USD}&language=english"
     )
-    async with session.get(url, timeout=20) as resp:
-        if resp.status != 200:
-            text = await resp.text()
-            raise RuntimeError(f"Steam listing render error {resp.status}: {text[:150]}")
-        return await resp.json(content_type=None)
+    retries = max(settings.steam_request_retries, 0)
+    for attempt in range(retries + 1):
+        try:
+            async with session.get(url, timeout=20) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    raise RuntimeError(f"Steam listing render error {resp.status}: {text[:150]}")
+                return await resp.json(content_type=None)
+        except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as exc:
+            if attempt >= retries:
+                raise
+            await asyncio.sleep(0.5 * (attempt + 1))
+            logging.warning(
+                "Retry Steam listing render market_hash_name=%s attempt=%s/%s: %s",
+                market_hash_name,
+                attempt + 2,
+                retries + 1,
+                exc,
+            )
+    return {}
 
 
 async def fetch_priceoverview(session: aiohttp.ClientSession, market_hash_name: str) -> float:
@@ -220,11 +252,24 @@ async def fetch_priceoverview(session: aiohttp.ClientSession, market_hash_name: 
         "https://steamcommunity.com/market/priceoverview/"
         f"?appid={APP_ID}&currency={CURRENCY_USD}&market_hash_name={quote(market_hash_name, safe='')}"
     )
-    async with session.get(url, timeout=20) as resp:
-        if resp.status != 200:
-            GEM_PRICE_CACHE[market_hash_name] = 0.0
-            return 0.0
-        data = await resp.json(content_type=None)
+    retries = max(settings.steam_request_retries, 0)
+    data = {}
+    for attempt in range(retries + 1):
+        try:
+            async with session.get(url, timeout=20) as resp:
+                if resp.status != 200:
+                    if resp.status in {429, 500, 502, 503, 504}:
+                        raise RuntimeError(f"Steam priceoverview error {resp.status}")
+                    GEM_PRICE_CACHE[market_hash_name] = 0.0
+                    return 0.0
+                data = await resp.json(content_type=None)
+                break
+        except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as exc:
+            if attempt >= retries:
+                GEM_PRICE_CACHE[market_hash_name] = 0.0
+                logging.warning("Steam priceoverview failed for %s: %s", market_hash_name, exc)
+                return 0.0
+            await asyncio.sleep(0.5 * (attempt + 1))
 
     price = 0.0
     if data.get("success") and isinstance(data.get("lowest_price"), str):

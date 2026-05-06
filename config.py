@@ -46,7 +46,17 @@ class Settings(BaseModel):
     discovery_queries: str = os.getenv("DISCOVERY_QUERIES", "__EMPTY__,Inscribed,Autographed")
     discovery_pages_per_query: int = int(os.getenv("DISCOVERY_PAGES_PER_QUERY", "1"))
     search_page_size: int = int(os.getenv("SEARCH_PAGE_SIZE", "40"))
-    require_keywords: str = os.getenv("REQUIRE_KEYWORDS", "inscribed,autographed")
+    # Optional name-level allow-list. Confirmed socket listings bypass this because
+    # their gems were extracted from the concrete listing render.
+    require_keywords: str = os.getenv("REQUIRE_KEYWORDS", "")
+    candidate_keywords: str = os.getenv(
+        "CANDIDATE_KEYWORDS",
+        "inscribed,autographed,kinetic,ethereal,prismatic",
+    )
+    exclude_item_keywords: str = os.getenv(
+        "EXCLUDE_ITEM_KEYWORDS",
+        "treasure,bundle,tool,recipe,loading screen,announcer,ward,booster pack",
+    )
     exclude_standalone_gems: bool = os.getenv("EXCLUDE_STANDALONE_GEMS", "true").lower() in {
         "1",
         "true",
@@ -55,6 +65,8 @@ class Settings(BaseModel):
     }
 
     min_confidence_score: int = int(os.getenv("MIN_CONFIDENCE_SCORE", "55"))
+    max_inspect_failures_per_run: int = int(os.getenv("MAX_INSPECT_FAILURES_PER_RUN", "8"))
+    steam_request_retries: int = int(os.getenv("STEAM_REQUEST_RETRIES", "2"))
     csv_file: str = os.getenv("CSV_FILE", "signals.csv")
 
 

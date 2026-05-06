@@ -21,11 +21,14 @@ logging.basicConfig(
 )
 
 
-def allowed_by_keywords(item_name: str) -> bool:
+def allowed_by_keywords(listing) -> bool:
+    if listing.value_source == "confirmed":
+        return True
+
     keywords = [k.strip().lower() for k in settings.require_keywords.split(",") if k.strip()]
     if not keywords:
         return True
-    name = item_name.lower()
+    name = listing.item_name.lower()
     return any(k in name for k in keywords)
 
 
@@ -65,10 +68,21 @@ def compute_confidence_score(opp) -> int:
     if "autographed" in name:
         score -= 8
 
+    priced_gems = [g for g in opp.listing.gems if g.market_price > 0]
+    unpriced_gems = [g for g in opp.listing.gems if g.market_price <= 0]
+
     if opp.gems_total > 0:
         score += 10
+    if len(priced_gems) >= 2:
+        score += 6
+    if any(g.name.lower().startswith(("ethereal gem", "prismatic gem", "kinetic gem")) for g in priced_gems):
+        score += 8
     if opp.listing.value_source == "confirmed":
         score += 35
+    if unpriced_gems:
+        score -= min(len(unpriced_gems) * 8, 24)
+    if opp.listing.value_source != "confirmed":
+        score -= 12
 
     return max(0, min(score, 100))
 
@@ -181,7 +195,7 @@ async def run_once(notifier: TelegramNotifier, storage: AlertStorage):
             print(f"[SKIP] {listing.item_name} price=${listing.buy_price:.2f} out_of_range")
             continue
 
-        if not allowed_by_keywords(listing.item_name):
+        if not allowed_by_keywords(listing):
             print(f"[SKIP] {listing.item_name} keyword_filter")
             continue
 
